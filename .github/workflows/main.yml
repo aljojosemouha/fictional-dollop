@@ -15,11 +15,14 @@ jobs:
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Disable Network Level Authentication
+          # Disable Network Level Authentication (NLA)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
 
-          # Set Security Layer to RDP (0)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          # ✅ الإصلاح: استخدام Negotiate (2) بدلاً من RDP Security Layer (0)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 2 -Force
+
+          # ✅ إضافة: ضبط مستوى التشفير إلى High
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'MinEncryptionLevel' -Value 3 -Force
 
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
@@ -29,6 +32,15 @@ jobs:
 
           # Restart the Remote Desktop service to apply changes
           Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 5
+
+          # ✅ التحقق من أن الخدمة تعمل
+          $svc = Get-Service -Name TermService
+          Write-Host "TermService Status: $($svc.Status)"
+          if ($svc.Status -ne 'Running') {
+              Write-Error "TermService is not running!"
+              exit 1
+          }
 
       - name: Create RDP User with Secure Password
         shell: pwsh
@@ -51,7 +63,7 @@ jobs:
           $password   = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators"       -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
@@ -106,6 +118,12 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+          # ✅ التحقق من إعدادات RDP الفعلية
+          $rdpSettings = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Write-Host "SecurityLayer:     $($rdpSettings.SecurityLayer)   (expected: 2)"
+          Write-Host "UserAuthentication: $($rdpSettings.UserAuthentication) (expected: 0)"
+          Write-Host "MinEncryptionLevel: $($rdpSettings.MinEncryptionLevel) (expected: 3)"
+
       - name: Maintain Connection
         shell: pwsh
         run: |
@@ -119,3 +137,79 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - Cancel the workflow to terminate"
               Start-Sleep -Seconds 300
           }
+
+      # ============================================================
+      # 🧹 خطوات التنظيف (تُنفَّذ دائماً حتى لو فشل الـ workflow)
+      # ============================================================
+      - name: Cleanup - Disconnect Tailscale
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Disconnecting Tailscale..."
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+              Write-Host "Tailscale disconnected and logged out."
+          } else {
+              Write-Host "Tailscale not installed, skipping."
+          }
+
+      - name: Cleanup - Remove RDP User
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Removing RDP user..."
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+              Write-Host "User 'RDP' removed."
+          } else {
+              Write-Host "User 'RDP' does not exist, skipping."
+          }
+
+      - name: Cleanup - Remove Firewall Rule
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Removing firewall rule..."
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          Write-Host "Firewall rule removed."
+
+      - name: Cleanup - Disable RDP
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Disabling RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Force
+          Write-Host "RDP disabled."
+
+      - name: Cleanup - Uninstall Tailscale
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Uninstalling Tailscale..."
+          $tsReg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DisplayName -like "*Tailscale*" } |
+                   Select-Object -First 1
+          if ($tsReg) {
+              Start-Process msiexec.exe -ArgumentList "/x", $tsReg.PSChildKey, "/quiet", "/norestart" -Wait
+              Write-Host "Tailscale uninstalled."
+          } else {
+              Write-Host "Tailscale not found, skipping."
+          }
+
+      - name: Cleanup Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "`n=== CLEANUP COMPLETE ==="
+          Write-Host "✅ Tailscale disconnected and logged out"
+          Write-Host "✅ RDP user removed"
+          Write-Host "✅ Firewall rule removed"
+          Write-Host "✅ RDP disabled"
+          Write-Host "✅ Tailscale uninstalled"
+          Write-Host "========================`n"
